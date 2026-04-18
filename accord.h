@@ -43,6 +43,14 @@ class Accord :public base::Thread  {
     }
     void Init();
     virtual ~Accord() {}
+    
+    // 公开的日志复制相关方法
+    bool appendLogEntry(const LogEntry& entry);
+    uint64_t getLastLogIndex();
+    uint64_t getLastLogTerm();
+    void sendAppendEntriesToAll();
+    bool waitForCommit(uint64_t log_index, int timeout_ms);
+    
   protected:
     virtual void Run();
 
@@ -76,7 +84,16 @@ class Accord :public base::Thread  {
     bool handleVoteReq(const Message& message);
     bool handleHeartReq(Message& message);
     bool handleQueryLeaderReq(const Message& message);
+    bool handleAppendEntriesReq(Message& message);
+    bool handleAppendEntriesRep(const Message& message);
     bool sendRPC(const std::string ip,const int port,const Message& message,const std::string rpc_name);
+    
+    // 日志复制相关方法
+    void sendAppendEntriesToNode(const NodeInfo& node_info);
+    void advanceCommitIndex();
+    void applyLogEntries();
+    bool getLogTerm(uint64_t index, uint64_t* term);
+    
     friend class Peer;
     scoped_ptr<Peer> peer_;
     RafDb* rafdb_;
