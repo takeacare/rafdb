@@ -179,6 +179,12 @@ void Accord::leaderLoop() {
     }
   }
   
+  // 初始化Pipeline状态（如果启用）
+  if (pipeline_enabled_) {
+    initPipelineState();
+    LOG(INFO) << "Pipeline replication initialized";
+  }
+  
   // 发送一个空的AppendEntries作为心跳
   sendAppendEntriesToAll();
   
@@ -200,10 +206,17 @@ void Accord::leaderLoop() {
       handleMessage(tmp_message);
     }
     
+    // 如果启用了Pipeline复制，持续发送日志
+    if (pipeline_enabled_) {
+      sendPipelineAppendEntries();
+    }
+    
     // 定期发送心跳（AppendEntries）
     heartbeat_counter++;
     if (heartbeat_counter >= kHeartbeatIntervalMs / kApplyLogIntervalMs) {
       heartbeat_counter = 0;
+      // 如果没有启用Pipeline，则发送常规的AppendEntries
+      // 如果启用了Pipeline，心跳已经由Pipeline机制处理，或者只发送空心跳
       sendAppendEntriesToAll();
     }
     
@@ -619,6 +632,12 @@ bool Accord::handleAppendEntriesRep(const Message& message) {
       next_index_[node_key] = new_match + 1;
       VLOG(5) << "Update match_index for " << node_key << " to " << new_match;
     }
+    
+    // 更新Pipeline状态（如果启用）
+    if (pipeline_enabled_) {
+      updatePipelineState(node_key, new_match);
+    }
+    
     // 尝试推进commit_index
     advanceCommitIndex();
   } else {
@@ -626,6 +645,17 @@ bool Accord::handleAppendEntriesRep(const Message& message) {
     if (next_index_[node_key] > 1) {
       next_index_[node_key]--;
       VLOG(5) << "Decrement next_index for " << node_key << " to " << next_index_[node_key];
+      
+      // 如果启用了Pipeline，重置Pipeline状态
+      if (pipeline_enabled_) {
+        PipelineNodeState& state = pipeline_state_[node_key];
+        state.next_inflight_index = next_index_[node_key];
+        state.highest_inflight = match_index_[node_key];
+        state.last_acked_index = match_index_[node_key];
+        state.inflight_available = true;
+        VLOG(5) << "Reset pipeline state for " << node_key 
+                << ", next_inflight=" << state.next_inflight_index;
+      }
     }
   }
   
@@ -658,6 +688,7 @@ void Accord::sendAppendEntriesToNode(const NodeInfo& node_info) {
   }
   
   uint64_t next_idx = next_index_[node_key];
+  uint64_t last_log_index = getLastLogIndex();
   uint64_t prev_log_index = next_idx - 1;
   uint64_t prev_log_term = 0;
   
@@ -676,9 +707,42 @@ void Accord::sendAppendEntriesToNode(const NodeInfo& node_info) {
   mess_send.prev_log_term = prev_log_term;
   mess_send.leader_commit = commit_index_;
   
-  // 收集需要发送的日志条目
-  // 简化实现：每次只发送一条日志，或者发送空的心跳
-  // 实际实现中可以批量发送
+  // 批量收集需要发送的日志条目
+  const uint64_t kMaxBatchEntries = 100; // 每次最多发送100条日志
+  
+  if (next_idx <= last_log_index) {
+    uint64_t entries_to_send = std::min(last_log_index - next_idx + 1, kMaxBatchEntries);
+    
+    VLOG(5) << "sendAppendEntriesToNode: sending " << entries_to_send 
+            << " entries to " << node_key << ", start_index=" << next_idx;
+    
+    for (uint64_t i = 0; i < entries_to_send; i++) {
+      uint64_t log_index = next_idx + i;
+      LogEntry entry;
+      
+      if (rafdb_->wal_ && rafdb_->wal_->GetLogEntry(log_index, &entry)) {
+        // 转换为thrift的LogEntry
+        rafdb::LogEntry thrift_entry;
+        thrift_entry.index = entry.index;
+        thrift_entry.term = entry.term;
+        thrift_entry.type = static_cast<rafdb::LogType>(entry.type);
+        thrift_entry.dbname = entry.dbname;
+        thrift_entry.key = entry.key;
+        thrift_entry.value = entry.value;
+        thrift_entry.crc = entry.crc;
+        
+        mess_send.entries.push_back(thrift_entry);
+        
+        VLOG(5) << "Added entry index=" << entry.index << " to batch";
+      } else {
+        LOG(ERROR) << "Failed to get log entry " << log_index << " from WAL";
+        break;
+      }
+    }
+  } else {
+    VLOG(5) << "sendAppendEntriesToNode: sending heartbeat to " << node_key 
+            << ", next_idx=" << next_idx << ", last_log_index=" << last_log_index;
+  }
   
   // 发送RPC
   sendRPC(node_info.ip, node_info.port, mess_send, "SendAppendEntries");
@@ -1257,53 +1321,47 @@ void Accord::sendPipelineAppendEntries() {
   }
   
   size_t node_count = rafdb_->GetNodeListSize();
-  uint64_t last_log_index = getLastLogIndex();
   
   for (size_t i = 0; i < node_count; i++) {
     NodeInfo node_info = rafdb_->GetNodeInfo(i);
     std::string node_key = node_info.ip + ":" + std::to_string(node_info.port);
     
     // 检查是否可以发送更多在途请求
-    while (canSendInflight(node_key)) {
-      PipelineNodeState& state = pipeline_state_[node_key];
+    base::MutexLock lock(&log_mutex_);
+    
+    PipelineNodeState& state = pipeline_state_[node_key];
+    uint64_t next_idx = next_index_[node_key];
+    uint64_t last_log_index = getLastLogIndex();
+    
+    // 计算在途请求数量
+    // highest_inflight 是发送过的最高索引
+    // last_acked_index 是已确认的最高索引
+    // match_index_[node_key] 也是已确认的最高索引（来自标准Raft机制）
+    uint64_t acked_index = std::max(state.last_acked_index, match_index_[node_key]);
+    uint64_t inflight_count = 0;
+    
+    if (state.highest_inflight > acked_index) {
+      inflight_count = state.highest_inflight - acked_index;
+    }
+    
+    // 如果在途请求数未达上限，且还有日志需要发送
+    if (inflight_count < max_inflight_per_node_ && next_idx <= last_log_index) {
+      VLOG(5) << "Pipeline: node=" << node_key 
+              << ", next_idx=" << next_idx 
+              << ", last_log=" << last_log_index
+              << ", inflight=" << inflight_count
+              << ", max_inflight=" << max_inflight_per_node_;
       
-      // 确定下一个要发送的日志索引
-      uint64_t next_idx = state.next_inflight_index;
-      if (next_idx > last_log_index) {
-        break; // 没有更多日志要发送
-      }
+      // 解锁，因为 sendAppendEntriesToNode 会获取锁
+      lock.Release();
       
-      // 发送日志
-      base::MutexLock lock(&log_mutex_);
+      // 使用现有的批量发送逻辑
+      sendAppendEntriesToNode(node_info);
       
-      uint64_t prev_log_index = next_idx - 1;
-      uint64_t prev_log_term = 0;
-      if (prev_log_index > 0) {
-        getLogTerm(prev_log_index, &prev_log_term);
-      }
-      
-      // 构建消息
-      Message mess_send;
-      mess_send.term_id = GetTerm();
-      mess_send.leader_id = rafdb_->self_id_;
-      mess_send.ip = rafdb_->ip_;
-      mess_send.port = rafdb_->port_;
-      mess_send.message_type = MessageType::APPENDENTRIESREQ;
-      mess_send.prev_log_index = prev_log_index;
-      mess_send.prev_log_term = prev_log_term;
-      mess_send.leader_commit = commit_index_;
-      
-      // 收集要发送的日志条目（批量发送）
-      // 这里简化为发送单条，实际可以批量
-      
-      VLOG(5) << "Pipeline: sending log " << next_idx << " to " << node_key;
-      
-      // 发送RPC（非阻塞）
-      sendRPC(node_info.ip, node_info.port, mess_send, "SendAppendEntries");
-      
-      // 更新Pipeline状态
-      state.highest_inflight = next_idx;
-      state.next_inflight_index = next_idx + 1;
+      // 更新highest_inflight（假设sendAppendEntriesToNode发送了至少一条日志）
+      // 实际实现中应该在发送后更新，但为了简化，我们依赖match_index的更新
+      base::MutexLock relock(&log_mutex_);
+      state.highest_inflight = next_index_[node_key] - 1;
     }
   }
 }
