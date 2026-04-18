@@ -428,7 +428,11 @@ bool Accord::sendRPC(const std::string ip,const int port,
 
 
 int Accord::quoramSize() {
-  return (rafdb_->GetNodeListSize()+1) / 2 + 1;
+  // 总节点数 = 其他节点数 + 自己
+  size_t total_nodes = rafdb_->GetNodeListSize() + 1;
+  // Quorum = 总节点数 / 2 + 1
+  // 例如：3节点=2，5节点=3，7节点=4
+  return (total_nodes / 2) + 1;
 }
 
 void Accord::handleHeartRep(const Message& message) {
