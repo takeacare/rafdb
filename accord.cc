@@ -217,6 +217,16 @@ void Accord::leaderLoop() {
 }
 
 void Accord::Init() {
+  // 初始化随机种子，只调用一次
+  // 种子 = 时间戳 + 进程ID + 节点ID
+  // 确保不同节点、不同时间、不同进程的随机性不同
+  uint64_t timestamp = base::GetMicroseconds();
+  uint32_t pid = base::GetCurrentProcessId();
+  uint64_t seed = timestamp ^ (static_cast<uint64_t>(pid) << 32) ^ rafdb_->self_id_;
+  srand(static_cast<unsigned int>(seed));
+  VLOG(5) << "Random seed initialized: timestamp=" << timestamp 
+          << ", pid=" << pid << ", self_id=" << rafdb_->self_id_;
+  
   peer_.reset(new Peer(this));
   peer_->Start();//heart beat thread
 }
@@ -448,11 +458,12 @@ void Accord::handleHeartRep(const Message& message) {
 }
 
 int Accord::get_rand(int start,int end) {
-      if (end <= start)
-        return start;
-      srand(rafdb_->self_id_);
-      return (rand() % (end-start))+ start;
-    }
+  if (end <= start)
+    return start;
+  // 注意：随机种子已在Init()中初始化，不要每次调用都重置
+  // 否则会导致每次返回相同的值，增加选举冲突
+  return (rand() % (end - start)) + start;
+}
 
 // 处理AppendEntries请求（Follower处理Leader的日志复制请求）
 bool Accord::handleAppendEntriesReq(Message& message) {

@@ -196,8 +196,13 @@ void Sync::sync_process(LKV_SYNC *lkv)
     else
     {
         VLOG(3)<<"the ip_port :"<<ip_port<< " is not in node_status_map";
-        delete lkv;
     }
+    // 修复内存泄漏：所有不return的路径都需要delete lkv
+    // 路径1：Set失败（第173-181行）
+    // 路径2：ip_port在node_status_map但不在node_set_map（第183-184行）
+    // 路径3：节点不alive（第186-194行）
+    // 路径4：ip_port不在node_status_map（第196-199行）- 原来这里有delete，但逻辑上应该统一处理
+    delete lkv;
 }
 void Sync::push(LKV_SYNC *lkv)
 {
