@@ -19,17 +19,18 @@ Sync::Sync(RafDb *rafdb)
     comsume_fail_queue_thread();
     if (NULL==sync_pool || NULL==for_fail_pool)
         VLOG(3)<<"sync_pool or for_fail_pool ==NULL";
-    if (rafdb_->NodeList.empty())
+    size_t node_count = rafdb_->GetNodeListSize();
+    if (node_count == 0)
         VLOG(3)<<"NodeList is Empty";
-    for(std::vector<NodeInfo>::iterator iter=rafdb_->NodeList.begin(); iter != rafdb_->NodeList.end();iter++)
+    for(size_t i = 0; i < node_count; i++)
     {
-        std::string ip_port=toIpPort(*iter);
+        NodeInfo node_info = rafdb_->GetNodeInfo(i);
+        std::string ip_port=toIpPort(node_info);
         node_status_map[ip_port]=alive;
-        rafdb::RafdbSync *dbSync=new RafdbSync(*iter);
+        rafdb::RafdbSync *dbSync=new RafdbSync(node_info);
         node_set_map[ip_port]=dbSync;
         fail_time_map[ip_port]=0;
         VLOG(3)<<"put in map : "<<ip_port;
-        
     }
     load_cache();
 }

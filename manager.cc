@@ -20,9 +20,11 @@ namespace rafdb {
         if (tmp == NULL) {
           continue;
         }
-        for(std::vector<NodeInfo>::iterator iter=rafdb_->NodeList.begin(); iter != rafdb_->NodeList.end();iter++)
+        size_t node_count = rafdb_->GetNodeListSize();
+        for(size_t i = 0; i < node_count; i++)
         {
-          LKV_SYNC *lkv=new LKV_SYNC(tmp->dbname,tmp->key,tmp->value,iter->ip,iter->port);
+          NodeInfo node_info = rafdb_->GetNodeInfo(i);
+          LKV_SYNC *lkv=new LKV_SYNC(tmp->dbname,tmp->key,tmp->value,node_info.ip,node_info.port);
           sync_->push(lkv);
         }
         delete tmp;
