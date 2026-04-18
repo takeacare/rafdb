@@ -16,6 +16,18 @@ DEFINE_string(rafdb_self, "", "rafdb self,192.168.11.12:1111:1");
 DEFINE_string(wal_dir, "/data/leveldb/wal/", "WAL storage directory");
 DEFINE_bool(enable_wal, true, "Enable WAL prewrite log");
 
+// 优化特性配置参数
+DEFINE_bool(enable_batch_commit, false, "Enable batch commit for better throughput");
+DEFINE_int32(batch_commit_size, 100, "Batch size for batch commit");
+DEFINE_int32(batch_commit_timeout_ms, 10, "Timeout in ms for batch commit");
+
+DEFINE_bool(enable_pipeline_replication, false, "Enable pipeline replication");
+DEFINE_int32(pipeline_max_inflight, 10, "Max inflight requests per node for pipeline");
+
+DEFINE_bool(enable_async_flush, false, "Enable async flush for WAL");
+DEFINE_int32(async_flush_interval_ms, 100, "Flush interval in ms for async flush");
+DEFINE_int32(async_flush_batch_size, 100, "Batch size for async flush");
+
 namespace rafdb {
 
 RafDb::RafDb() {
@@ -91,6 +103,23 @@ void RafDb::Init() {
   manager_.reset(new Manager(this));
   manager_->Start();
 
+  // 根据配置参数启用优化特性
+  if (FLAGS_enable_batch_commit) {
+    EnableBatchCommit(true, FLAGS_batch_commit_size, FLAGS_batch_commit_timeout_ms);
+    LOG(INFO) << "Batch commit enabled via config: size=" << FLAGS_batch_commit_size 
+              << ", timeout_ms=" << FLAGS_batch_commit_timeout_ms;
+  }
+  
+  if (FLAGS_enable_pipeline_replication) {
+    EnablePipeline(true, FLAGS_pipeline_max_inflight);
+    LOG(INFO) << "Pipeline replication enabled via config: max_inflight=" << FLAGS_pipeline_max_inflight;
+  }
+  
+  if (FLAGS_enable_async_flush) {
+    EnableAsyncFlush(true, FLAGS_async_flush_interval_ms, FLAGS_async_flush_batch_size);
+    LOG(INFO) << "Async flush enabled via config: interval_ms=" << FLAGS_async_flush_interval_ms
+              << ", batch_size=" << FLAGS_async_flush_batch_size;
+  }
 }
 
 bool RafDb::Set(const std::string &dbname, const std::string &key,
@@ -1083,6 +1112,133 @@ bool RafDb::RaftSet(const std::string &dbname, const std::string &key, const std
 void RafDb::ApplyLogEntry(const std::string &dbname, const std::string &key, const std::string &value) {
   if (!Set(dbname, key, value)) {
     LOG(ERROR) << "ApplyLogEntry: failed to apply log entry to LevelDB";
+  }
+}
+
+// 批量应用日志条目到状态机
+void RafDb::ApplyBatchEntries(const std::vector<BatchEntry> &entries) {
+  if (entries.empty()) {
+    return;
+  }
+  
+  // 按数据库分组，提高效率
+  base::hash_map<std::string, std::vector<std::pair<std::string, std::string>>> db_batches;
+  
+  for (size_t i = 0; i < entries.size(); i++) {
+    const BatchEntry& entry = entries[i];
+    db_batches[entry.dbname].push_back(std::make_pair(entry.key, entry.value));
+  }
+  
+  // 对每个数据库执行批量写入
+  for (base::hash_map<std::string, std::vector<std::pair<std::string, std::string>>>::iterator 
+       it = db_batches.begin(); it != db_batches.end(); ++it) {
+    const std::string& dbname = it->first;
+    const std::vector<std::pair<std::string, std::string>>& pairs = it->second;
+    
+    leveldb::DB *db = NULL;
+    {
+      base::MutexLock lock(&db_map_mutex_);
+      base::hash_map<std::string, leveldb::DB*>::iterator db_it = db_map_.find(dbname);
+      if (db_it == db_map_.end()) {
+        db = Open(dbname);
+        if (db == NULL) {
+          LOG(ERROR) << "ApplyBatchEntries: failed to open db " << dbname;
+          continue;
+        }
+      } else {
+        db = db_it->second;
+      }
+    }
+    
+    // 使用WriteBatch批量写入
+    leveldb::WriteBatch wBatch;
+    for (size_t j = 0; j < pairs.size(); j++) {
+      wBatch.Put(pairs[j].first, pairs[j].second);
+    }
+    
+    leveldb::Status status = db->Write(woptions_, &wBatch);
+    if (!status.ok()) {
+      LOG(ERROR) << "ApplyBatchEntries: failed to write batch to db " << dbname;
+    }
+  }
+}
+
+// Raft批量写入实现
+bool RafDb::RaftBatchSet(const std::vector<BatchEntry> &entries) {
+  if (entries.empty()) {
+    return true;
+  }
+  
+  // 1. 检查是否是Leader
+  if (!IsLeader()) {
+    LOG(WARNING) << "RaftBatchSet: not leader, cannot write";
+    return false;
+  }
+  
+  VLOG(5) << "RaftBatchSet: " << entries.size() << " entries";
+  
+  // 2. 创建日志条目列表
+  std::vector<LogEntry> log_entries;
+  for (size_t i = 0; i < entries.size(); i++) {
+    LogEntry entry;
+    entry.type = LOG_TYPE_NORMAL;
+    entry.dbname = entries[i].dbname;
+    entry.key = entries[i].key;
+    entry.value = entries[i].value;
+    log_entries.push_back(entry);
+  }
+  
+  // 3. 批量追加到WAL
+  if (!accord_->appendLogEntries(log_entries)) {
+    LOG(ERROR) << "RaftBatchSet: failed to append log entries";
+    return false;
+  }
+  
+  // 4. 获取新写入日志的起始和结束索引
+  uint64_t end_log_index = accord_->getLastLogIndex();
+  uint64_t start_log_index = end_log_index - entries.size() + 1;
+  
+  VLOG(5) << "RaftBatchSet: log indices " << start_log_index << " to " << end_log_index;
+  
+  // 5. 立即向所有Follower发送AppendEntries
+  accord_->sendAppendEntriesToAll();
+  
+  // 6. 等待多数节点确认（等待日志被提交）
+  const int kTimeoutMs = 5000; // 5秒超时
+  if (!accord_->waitForCommit(end_log_index, kTimeoutMs)) {
+    LOG(ERROR) << "RaftBatchSet: timeout waiting for commit, end_index=" << end_log_index;
+    return false;
+  }
+  
+  // 7. 日志已提交，应用到状态机（写入LevelDB）
+  ApplyBatchEntries(entries);
+  
+  VLOG(5) << "RaftBatchSet: success, " << entries.size() << " entries";
+  return true;
+}
+
+// 启用批量提交
+void RafDb::EnableBatchCommit(bool enable, uint64_t batch_size, uint64_t batch_timeout_ms) {
+  if (accord_) {
+    accord_->EnableBatchCommit(enable, batch_size, batch_timeout_ms);
+  }
+}
+
+// 启用Pipeline复制
+void RafDb::EnablePipeline(bool enable, uint64_t max_inflight) {
+  if (accord_) {
+    accord_->EnablePipeline(enable, max_inflight);
+  }
+}
+
+// 启用异步刷盘
+void RafDb::EnableAsyncFlush(bool enable, uint64_t flush_interval_ms, uint64_t batch_size) {
+  // 同时启用Accord层和WAL层的异步刷盘
+  if (accord_) {
+    accord_->EnableAsyncFlush(enable);
+  }
+  if (wal_) {
+    wal_->EnableAsyncFlush(enable, flush_interval_ms, batch_size);
   }
 }
 
