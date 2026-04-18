@@ -100,7 +100,14 @@ class RafDb : virtual public rafdb::RafdbServiceIf {
     
     // Raft日志复制相关方法
     bool RaftSet(const std::string &dbname, const std::string &key, const std::string &value);
+    bool RaftBatchSet(const std::vector<BatchEntry> &entries);
     void ApplyLogEntry(const std::string &dbname, const std::string &key, const std::string &value);
+    void ApplyBatchEntries(const std::vector<BatchEntry> &entries);
+    
+    // 启用优化特性
+    void EnableBatchCommit(bool enable, uint64_t batch_size = 100, uint64_t batch_timeout_ms = 10);
+    void EnablePipeline(bool enable, uint64_t max_inflight = 10);
+    void EnableAsyncFlush(bool enable, uint64_t flush_interval_ms = 100, uint64_t batch_size = 100);
     
     size_t GetNodeListSize() {
       base::MutexLock lock(&node_list_mutex_);
