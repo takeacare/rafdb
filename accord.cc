@@ -720,10 +720,26 @@ void Accord::applyLogEntries() {
   base::MutexLock lock(&log_mutex_);
   
   while (last_applied_ < commit_index_) {
-    last_applied_++;
-    VLOG(5) << "Applying log entry " << last_applied_;
-    // 实际实现中需要从WAL读取日志并应用到LevelDB
-    // 这里简化处理
+    uint64_t apply_index = last_applied_ + 1;
+    VLOG(5) << "Applying log entry " << apply_index;
+    
+    // 从WAL读取日志条目
+    LogEntry entry;
+    if (rafdb_->wal_ && rafdb_->wal_->GetLogEntry(apply_index, &entry)) {
+      VLOG(5) << "Read log entry: index=" << entry.index 
+              << ", dbname=" << entry.dbname 
+              << ", key=" << entry.key;
+      
+      // 应用到状态机（写入LevelDB）
+      if (entry.type == LOG_TYPE_NORMAL) {
+        rafdb_->ApplyLogEntry(entry.dbname, entry.key, entry.value);
+        VLOG(5) << "Applied log entry " << apply_index << " to LevelDB";
+      }
+    } else {
+      LOG(ERROR) << "Failed to read log entry " << apply_index << " from WAL";
+    }
+    
+    last_applied_ = apply_index;
   }
 }
 
@@ -749,11 +765,14 @@ uint64_t Accord::getLastLogTerm() {
 
 // 获取指定索引的日志任期
 bool Accord::getLogTerm(uint64_t index, uint64_t* term) {
-  // 简化实现：实际需要从WAL读取
-  // 这里假设WAL支持按索引查询
   *term = 0;
   
-  // 如果查询的是最后一条日志
+  // 调用WAL的GetLogTerm方法（快速查询，通过内存索引）
+  if (rafdb_->wal_) {
+    return rafdb_->wal_->GetLogTerm(index, term);
+  }
+  
+  // 如果没有WAL，只返回最后一条日志的term
   uint64_t last_index = getLastLogIndex();
   uint64_t last_term = getLastLogTerm();
   
@@ -762,8 +781,6 @@ bool Accord::getLogTerm(uint64_t index, uint64_t* term) {
     return true;
   }
   
-  // 对于更早的日志，简化处理
-  // 实际实现需要从WAL中读取
   return false;
 }
 
