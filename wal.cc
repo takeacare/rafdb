@@ -590,7 +590,7 @@ bool WAL::ReadFrom(uint64_t index, void (*callback)(const LogEntry&)) {
 
     uint64_t offset = 0;
     LogEntry entry;
-    while (ReadEntry(fd, &entry, &offset)) {
+    while (ReadEntryV2(fd, &entry, &offset)) {
       if (entry.index >= index) {
         callback(entry);
       }
