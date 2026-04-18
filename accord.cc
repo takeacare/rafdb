@@ -179,6 +179,12 @@ void Accord::leaderLoop() {
     }
   }
   
+  // 初始化Pipeline状态（如果启用）
+  if (pipeline_enabled_) {
+    initPipelineState();
+    LOG(INFO) << "Pipeline replication initialized";
+  }
+  
   // 发送一个空的AppendEntries作为心跳
   sendAppendEntriesToAll();
   
@@ -200,10 +206,17 @@ void Accord::leaderLoop() {
       handleMessage(tmp_message);
     }
     
+    // 如果启用了Pipeline复制，持续发送日志
+    if (pipeline_enabled_) {
+      sendPipelineAppendEntries();
+    }
+    
     // 定期发送心跳（AppendEntries）
     heartbeat_counter++;
     if (heartbeat_counter >= kHeartbeatIntervalMs / kApplyLogIntervalMs) {
       heartbeat_counter = 0;
+      // 如果没有启用Pipeline，则发送常规的AppendEntries
+      // 如果启用了Pipeline，心跳已经由Pipeline机制处理，或者只发送空心跳
       sendAppendEntriesToAll();
     }
     
@@ -619,6 +632,12 @@ bool Accord::handleAppendEntriesRep(const Message& message) {
       next_index_[node_key] = new_match + 1;
       VLOG(5) << "Update match_index for " << node_key << " to " << new_match;
     }
+    
+    // 更新Pipeline状态（如果启用）
+    if (pipeline_enabled_) {
+      updatePipelineState(node_key, new_match);
+    }
+    
     // 尝试推进commit_index
     advanceCommitIndex();
   } else {
@@ -626,6 +645,17 @@ bool Accord::handleAppendEntriesRep(const Message& message) {
     if (next_index_[node_key] > 1) {
       next_index_[node_key]--;
       VLOG(5) << "Decrement next_index for " << node_key << " to " << next_index_[node_key];
+      
+      // 如果启用了Pipeline，重置Pipeline状态
+      if (pipeline_enabled_) {
+        PipelineNodeState& state = pipeline_state_[node_key];
+        state.next_inflight_index = next_index_[node_key];
+        state.highest_inflight = match_index_[node_key];
+        state.last_acked_index = match_index_[node_key];
+        state.inflight_available = true;
+        VLOG(5) << "Reset pipeline state for " << node_key 
+                << ", next_inflight=" << state.next_inflight_index;
+      }
     }
   }
   
@@ -658,6 +688,7 @@ void Accord::sendAppendEntriesToNode(const NodeInfo& node_info) {
   }
   
   uint64_t next_idx = next_index_[node_key];
+  uint64_t last_log_index = getLastLogIndex();
   uint64_t prev_log_index = next_idx - 1;
   uint64_t prev_log_term = 0;
   
@@ -676,9 +707,42 @@ void Accord::sendAppendEntriesToNode(const NodeInfo& node_info) {
   mess_send.prev_log_term = prev_log_term;
   mess_send.leader_commit = commit_index_;
   
-  // 收集需要发送的日志条目
-  // 简化实现：每次只发送一条日志，或者发送空的心跳
-  // 实际实现中可以批量发送
+  // 批量收集需要发送的日志条目
+  const uint64_t kMaxBatchEntries = 100; // 每次最多发送100条日志
+  
+  if (next_idx <= last_log_index) {
+    uint64_t entries_to_send = std::min(last_log_index - next_idx + 1, kMaxBatchEntries);
+    
+    VLOG(5) << "sendAppendEntriesToNode: sending " << entries_to_send 
+            << " entries to " << node_key << ", start_index=" << next_idx;
+    
+    for (uint64_t i = 0; i < entries_to_send; i++) {
+      uint64_t log_index = next_idx + i;
+      LogEntry entry;
+      
+      if (rafdb_->wal_ && rafdb_->wal_->GetLogEntry(log_index, &entry)) {
+        // 转换为thrift的LogEntry
+        rafdb::LogEntry thrift_entry;
+        thrift_entry.index = entry.index;
+        thrift_entry.term = entry.term;
+        thrift_entry.type = static_cast<rafdb::LogType>(entry.type);
+        thrift_entry.dbname = entry.dbname;
+        thrift_entry.key = entry.key;
+        thrift_entry.value = entry.value;
+        thrift_entry.crc = entry.crc;
+        
+        mess_send.entries.push_back(thrift_entry);
+        
+        VLOG(5) << "Added entry index=" << entry.index << " to batch";
+      } else {
+        LOG(ERROR) << "Failed to get log entry " << log_index << " from WAL";
+        break;
+      }
+    }
+  } else {
+    VLOG(5) << "sendAppendEntriesToNode: sending heartbeat to " << node_key 
+            << ", next_idx=" << next_idx << ", last_log_index=" << last_log_index;
+  }
   
   // 发送RPC
   sendRPC(node_info.ip, node_info.port, mess_send, "SendAppendEntries");
@@ -1029,6 +1093,297 @@ void Accord::compactLogs() {
   }
   
   VLOG(5) << "Log compaction completed, snapshot index=" << snapshot_index;
+}
+
+// 启用批量提交
+void Accord::EnableBatchCommit(bool enable, uint64_t batch_size, 
+                                uint64_t batch_timeout_ms) {
+  if (enable == batch_enabled_) {
+    return;
+  }
+  
+  if (enable) {
+    batch_enabled_ = true;
+    batch_size_ = batch_size;
+    batch_timeout_ms_ = batch_timeout_ms;
+    batch_thread_running_ = true;
+    
+    // 启动批量提交线程
+    class BatchCommitThread : public base::Thread {
+     public:
+      BatchCommitThread(Accord* accord) : accord_(accord) {}
+     protected:
+      virtual void Run() {
+        accord_->batchCommitLoop();
+      }
+     private:
+      Accord* accord_;
+    };
+    
+    batch_commit_thread_.reset(new BatchCommitThread(this));
+    batch_commit_thread_->Start();
+    
+    LOG(INFO) << "Batch commit enabled, batch_size=" << batch_size 
+              << ", timeout_ms=" << batch_timeout_ms;
+  } else {
+    // 停止批量提交线程
+    batch_thread_running_ = false;
+    {
+      base::MutexLock lock(&batch_mutex_);
+      batch_cond_.SignalAll();
+    }
+    if (batch_commit_thread_) {
+      batch_commit_thread_->Join();
+    }
+    batch_enabled_ = false;
+    LOG(INFO) << "Batch commit disabled";
+  }
+}
+
+// 启用Pipeline复制
+void Accord::EnablePipeline(bool enable, uint64_t max_inflight) {
+  if (enable == pipeline_enabled_) {
+    return;
+  }
+  
+  pipeline_enabled_ = enable;
+  max_inflight_per_node_ = max_inflight;
+  
+  if (enable) {
+    LOG(INFO) << "Pipeline replication enabled, max_inflight=" << max_inflight;
+  } else {
+    LOG(INFO) << "Pipeline replication disabled";
+  }
+}
+
+// 启用异步刷盘
+void Accord::EnableAsyncFlush(bool enable) {
+  if (enable == async_flush_enabled_) {
+    return;
+  }
+  
+  async_flush_enabled_ = enable;
+  
+  if (enable && rafdb_->wal_) {
+    LOG(INFO) << "Async flush enabled at Accord layer";
+  } else {
+    LOG(INFO) << "Async flush disabled at Accord layer";
+  }
+}
+
+// 批量追加日志条目
+bool Accord::appendLogEntries(const std::vector<LogEntry>& entries) {
+  if (state_ != State::LEADER) {
+    return false;
+  }
+  
+  if (entries.empty()) {
+    return true;
+  }
+  
+  base::MutexLock lock(&log_mutex_);
+  
+  uint64_t start_index = getLastLogIndex() + 1;
+  std::vector<LogEntry> new_entries;
+  
+  for (size_t i = 0; i < entries.size(); i++) {
+    LogEntry new_entry = entries[i];
+    new_entry.index = start_index + i;
+    new_entry.term = GetTerm();
+    new_entries.push_back(new_entry);
+  }
+  
+  // 写入WAL（如果启用异步刷盘则使用异步模式）
+  if (rafdb_->wal_) {
+    bool use_async = async_flush_enabled_;
+    if (!rafdb_->wal_->AppendLogBatch(new_entries, !use_async)) {
+      LOG(ERROR) << "Failed to append log batch to WAL";
+      return false;
+    }
+  }
+  
+  LOG(INFO) << "Appended " << new_entries.size() << " log entries, start_index=" << start_index;
+  
+  return true;
+}
+
+// 等待批量提交
+bool Accord::waitForBatchCommit(const std::vector<uint64_t>& indices, int timeout_ms) {
+  if (indices.empty()) {
+    return true;
+  }
+  
+  uint64_t max_index = 0;
+  for (size_t i = 0; i < indices.size(); i++) {
+    if (indices[i] > max_index) {
+      max_index = indices[i];
+    }
+  }
+  
+  return waitForCommit(max_index, timeout_ms);
+}
+
+// 批量提交线程循环
+void Accord::batchCommitLoop() {
+  LOG(INFO) << "Batch commit thread started";
+  
+  while (batch_thread_running_) {
+    std::vector<LogEntry> batch;
+    
+    {
+      base::MutexLock lock(&batch_mutex_);
+      
+      // 等待条件变量（超时或队列满）
+      if (pending_batch_.empty()) {
+        batch_cond_.TimedWait(&batch_mutex_, batch_timeout_ms_ * 1000);
+      }
+      
+      // 收集批量数据
+      while (!pending_batch_.empty() && batch.size() < batch_size_) {
+        batch.push_back(pending_batch_.front());
+        pending_batch_.pop();
+      }
+    }
+    
+    // 执行批量提交
+    if (!batch.empty() && state_ == State::LEADER) {
+      if (appendLogEntries(batch)) {
+        // 发送AppendEntries到所有节点
+        sendAppendEntriesToAll();
+      }
+    }
+  }
+  
+  LOG(INFO) << "Batch commit thread stopped";
+}
+
+// 刷新待处理的批量
+void Accord::flushPendingBatch() {
+  if (!batch_enabled_) {
+    return;
+  }
+  
+  base::MutexLock lock(&batch_mutex_);
+  batch_cond_.Signal();
+}
+
+// 初始化Pipeline状态
+void Accord::initPipelineState() {
+  if (!pipeline_enabled_) {
+    return;
+  }
+  
+  uint64_t last_log_index = getLastLogIndex();
+  size_t node_count = rafdb_->GetNodeListSize();
+  
+  for (size_t i = 0; i < node_count; i++) {
+    NodeInfo node_info = rafdb_->GetNodeInfo(i);
+    std::string node_key = node_info.ip + ":" + std::to_string(node_info.port);
+    
+    PipelineNodeState& state = pipeline_state_[node_key];
+    state.next_inflight_index = last_log_index + 1;
+    state.highest_inflight = 0;
+    state.last_acked_index = 0;
+    state.inflight_available = true;
+  }
+}
+
+// 检查是否可以发送在途请求
+bool Accord::canSendInflight(const std::string& node_key) {
+  if (!pipeline_enabled_) {
+    return true;
+  }
+  
+  PipelineNodeState& state = pipeline_state_[node_key];
+  uint64_t inflight_count = state.highest_inflight - state.last_acked_index;
+  
+  return inflight_count < max_inflight_per_node_;
+}
+
+// 更新Pipeline状态
+void Accord::updatePipelineState(const std::string& node_key, uint64_t acked_index) {
+  if (!pipeline_enabled_) {
+    return;
+  }
+  
+  PipelineNodeState& state = pipeline_state_[node_key];
+  
+  if (acked_index > state.last_acked_index) {
+    state.last_acked_index = acked_index;
+    state.inflight_available = true;
+  }
+}
+
+// 发送Pipeline复制的AppendEntries
+void Accord::sendPipelineAppendEntries() {
+  if (!pipeline_enabled_ || state_ != State::LEADER) {
+    return;
+  }
+  
+  size_t node_count = rafdb_->GetNodeListSize();
+  
+  for (size_t i = 0; i < node_count; i++) {
+    NodeInfo node_info = rafdb_->GetNodeInfo(i);
+    std::string node_key = node_info.ip + ":" + std::to_string(node_info.port);
+    
+    // 检查是否可以发送更多在途请求
+    base::MutexLock lock(&log_mutex_);
+    
+    PipelineNodeState& state = pipeline_state_[node_key];
+    uint64_t next_idx = next_index_[node_key];
+    uint64_t last_log_index = getLastLogIndex();
+    
+    // 计算在途请求数量
+    // highest_inflight 是发送过的最高索引
+    // last_acked_index 是已确认的最高索引
+    // match_index_[node_key] 也是已确认的最高索引（来自标准Raft机制）
+    uint64_t acked_index = std::max(state.last_acked_index, match_index_[node_key]);
+    uint64_t inflight_count = 0;
+    
+    if (state.highest_inflight > acked_index) {
+      inflight_count = state.highest_inflight - acked_index;
+    }
+    
+    // 如果在途请求数未达上限，且还有日志需要发送
+    if (inflight_count < max_inflight_per_node_ && next_idx <= last_log_index) {
+      VLOG(5) << "Pipeline: node=" << node_key 
+              << ", next_idx=" << next_idx 
+              << ", last_log=" << last_log_index
+              << ", inflight=" << inflight_count
+              << ", max_inflight=" << max_inflight_per_node_;
+      
+      // 解锁，因为 sendAppendEntriesToNode 会获取锁
+      lock.Release();
+      
+      // 使用现有的批量发送逻辑
+      sendAppendEntriesToNode(node_info);
+      
+      // 更新highest_inflight（假设sendAppendEntriesToNode发送了至少一条日志）
+      // 实际实现中应该在发送后更新，但为了简化，我们依赖match_index的更新
+      base::MutexLock relock(&log_mutex_);
+      state.highest_inflight = next_index_[node_key] - 1;
+    }
+  }
+}
+
+// 通知等待提交的请求
+void Accord::notifyCommitWaiters(uint64_t commit_index) {
+  base::MutexLock lock(&commit_wait_mutex_);
+  
+  // 通知所有等待索引 <= commit_index 的请求
+  base::hash_map<uint64_t, base::ConditionVariable*>::iterator it = 
+      commit_waiters_.begin();
+  while (it != commit_waiters_.end()) {
+    if (it->first <= commit_index) {
+      if (it->second) {
+        it->second->SignalAll();
+      }
+      // 不删除，因为可能有多个等待者
+      ++it;
+    } else {
+      ++it;
+    }
+  }
 }
 
 }

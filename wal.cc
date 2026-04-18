@@ -23,15 +23,343 @@ WAL::WAL(const std::string& wal_dir, uint64_t segment_size)
       current_segment_id_(0),
       current_offset_(0),
       last_index_(0),
-      last_term_(0) {
+      last_term_(0),
+      async_flush_enabled_(false),
+      flush_interval_ms_(100),
+      batch_size_(100),
+      last_flushed_index_(0),
+      async_flush_running_(false) {
 }
 
 WAL::~WAL() {
+  StopAsyncFlush();
   if (current_fd_ >= 0) {
     Sync();
     close(current_fd_);
     current_fd_ = -1;
   }
+}
+
+void WAL::StopAsyncFlush() {
+  if (async_flush_running_) {
+    async_flush_running_ = false;
+    {
+      base::MutexLock lock(&flush_mutex_);
+      flush_cond_.SignalAll();
+    }
+    // 等待线程结束
+    if (async_flush_thread_) {
+      async_flush_thread_->Join();
+    }
+  }
+}
+
+void WAL::EnableAsyncFlush(bool enable, uint64_t flush_interval_ms, 
+                           uint64_t batch_size) {
+  if (enable == async_flush_enabled_) {
+    return;
+  }
+  
+  if (enable) {
+    async_flush_enabled_ = true;
+    flush_interval_ms_ = flush_interval_ms;
+    batch_size_ = batch_size;
+    async_flush_running_ = true;
+    
+    // 启动异步刷盘线程
+    class AsyncFlushThread : public base::Thread {
+     public:
+      AsyncFlushThread(WAL* wal) : wal_(wal) {}
+     protected:
+      virtual void Run() {
+        wal_->AsyncFlushLoop();
+      }
+     private:
+      WAL* wal_;
+    };
+    
+    async_flush_thread_.reset(new AsyncFlushThread(this));
+    async_flush_thread_->Start();
+    
+    LOG(INFO) << "Async flush enabled, interval=" << flush_interval_ms 
+              << "ms, batch_size=" << batch_size;
+  } else {
+    StopAsyncFlush();
+    async_flush_enabled_ = false;
+    LOG(INFO) << "Async flush disabled";
+  }
+}
+
+bool WAL::AppendLog(const LogEntry& entry, bool sync) {
+  if (async_flush_enabled_ && !sync) {
+    // 异步模式，放入队列
+    base::MutexLock lock(&flush_mutex_);
+    pending_flush_queue_.push(entry);
+    
+    // 如果队列大小达到batch_size，触发立即刷盘
+    if (pending_flush_queue_.size() >= batch_size_) {
+      flush_cond_.Signal();
+    }
+    
+    return true;
+  }
+  
+  // 同步模式或强制sync=true，走原有逻辑
+  base::MutexLock lock(&mutex_);
+  if (current_fd_ < 0) {
+    LOG(ERROR) << "WAL not initialized";
+    return false;
+  }
+
+  // 检查是否需要滚动段文件
+  uint32_t entry_size = kEntryHeaderSizeV2 + 
+                        static_cast<uint32_t>(entry.dbname.size()) + 
+                        static_cast<uint32_t>(entry.key.size()) + 
+                        static_cast<uint32_t>(entry.value.size());
+  if (current_offset_ + entry_size > segment_size_) {
+    if (!RotateSegment()) {
+      return false;
+    }
+  }
+
+  // 计算CRC
+  LogEntry entry_with_crc = entry;
+  entry_with_crc.crc = CalculateCRC(entry);
+
+  // 记录写入前的偏移（用于索引）
+  uint64_t entry_offset = current_offset_;
+
+  // 写入日志
+  if (!WriteEntryV2(current_fd_, entry_with_crc, &current_offset_)) {
+    return false;
+  }
+
+  // 刷盘
+  if (sync) {
+    if (!Sync()) {
+      return false;
+    }
+  }
+
+  // 更新内存索引
+  log_index_[entry.index] = LogPosition(current_segment_id_, entry_offset, entry.term);
+
+  // 更新最后日志信息
+  last_index_ = entry.index;
+  last_term_ = entry.term;
+
+  VLOG(5) << "AppendLog: index=" << entry.index << ", term=" << entry.term 
+          << ", segment=" << current_segment_id_ << ", offset=" << entry_offset;
+
+  return true;
+}
+
+bool WAL::AppendLogBatch(const std::vector<LogEntry>& entries, bool sync) {
+  if (entries.empty()) {
+    return true;
+  }
+  
+  base::MutexLock lock(&mutex_);
+  if (current_fd_ < 0) {
+    LOG(ERROR) << "WAL not initialized";
+    return false;
+  }
+  
+  uint64_t max_index = 0;
+  uint64_t max_term = 0;
+  
+  for (size_t i = 0; i < entries.size(); i++) {
+    const LogEntry& entry = entries[i];
+    
+    // 检查是否需要滚动段文件
+    uint32_t entry_size = kEntryHeaderSizeV2 + 
+                          static_cast<uint32_t>(entry.dbname.size()) + 
+                          static_cast<uint32_t>(entry.key.size()) + 
+                          static_cast<uint32_t>(entry.value.size());
+    if (current_offset_ + entry_size > segment_size_) {
+      if (!RotateSegment()) {
+        return false;
+      }
+    }
+
+    // 计算CRC
+    LogEntry entry_with_crc = entry;
+    entry_with_crc.crc = CalculateCRC(entry);
+
+    // 记录写入前的偏移（用于索引）
+    uint64_t entry_offset = current_offset_;
+
+    // 写入日志
+    if (!WriteEntryV2(current_fd_, entry_with_crc, &current_offset_)) {
+      return false;
+    }
+
+    // 更新内存索引
+    log_index_[entry.index] = LogPosition(current_segment_id_, entry_offset, entry.term);
+
+    // 更新最大index和term
+    if (entry.index > max_index) {
+      max_index = entry.index;
+      max_term = entry.term;
+    }
+    
+    VLOG(5) << "AppendLogBatch: index=" << entry.index << ", term=" << entry.term;
+  }
+  
+  // 刷盘
+  if (sync) {
+    if (!Sync()) {
+      return false;
+    }
+  }
+  
+  // 更新最后日志信息
+  last_index_ = max_index;
+  last_term_ = max_term;
+  
+  LOG(INFO) << "AppendLogBatch: " << entries.size() << " entries, max_index=" << max_index;
+  
+  return true;
+}
+
+void WAL::AsyncFlushLoop() {
+  LOG(INFO) << "Async flush thread started";
+  
+  while (async_flush_running_) {
+    std::vector<LogEntry> batch;
+    uint64_t max_index = 0;
+    
+    {
+      base::MutexLock lock(&flush_mutex_);
+      
+      // 等待条件变量（超时或队列满）
+      if (pending_flush_queue_.empty()) {
+        flush_cond_.TimedWait(&flush_mutex_, flush_interval_ms_ * 1000);
+      }
+      
+      // 收集批量数据
+      while (!pending_flush_queue_.empty() && batch.size() < batch_size_) {
+        LogEntry entry = pending_flush_queue_.front();
+        pending_flush_queue_.pop();
+        batch.push_back(entry);
+        if (entry.index > max_index) {
+          max_index = entry.index;
+        }
+      }
+    }
+    
+    // 执行刷盘
+    if (!batch.empty()) {
+      if (DoFlush(batch)) {
+        last_flushed_index_ = max_index;
+        VLOG(5) << "Async flush completed, entries=" << batch.size() 
+                << ", max_index=" << max_index;
+      } else {
+        LOG(ERROR) << "Async flush failed!";
+      }
+    }
+  }
+  
+  // 退出前刷盘所有剩余数据
+  std::vector<LogEntry> remaining;
+  {
+    base::MutexLock lock(&flush_mutex_);
+    while (!pending_flush_queue_.empty()) {
+      remaining.push_back(pending_flush_queue_.front());
+      pending_flush_queue_.pop();
+    }
+  }
+  
+  if (!remaining.empty()) {
+    DoFlush(remaining);
+    LOG(INFO) << "Async flush thread stopped, flushed remaining " 
+              << remaining.size() << " entries";
+  }
+}
+
+bool WAL::DoFlush(const std::vector<LogEntry>& entries) {
+  if (entries.empty()) {
+    return true;
+  }
+  
+  base::MutexLock lock(&mutex_);
+  if (current_fd_ < 0) {
+    LOG(ERROR) << "WAL not initialized for async flush";
+    return false;
+  }
+  
+  uint64_t max_index = 0;
+  uint64_t max_term = 0;
+  
+  for (size_t i = 0; i < entries.size(); i++) {
+    const LogEntry& entry = entries[i];
+    
+    // 检查是否需要滚动段文件
+    uint32_t entry_size = kEntryHeaderSizeV2 + 
+                          static_cast<uint32_t>(entry.dbname.size()) + 
+                          static_cast<uint32_t>(entry.key.size()) + 
+                          static_cast<uint32_t>(entry.value.size());
+    if (current_offset_ + entry_size > segment_size_) {
+      if (!RotateSegment()) {
+        return false;
+      }
+    }
+
+    // 记录写入前的偏移（用于索引）
+    uint64_t entry_offset = current_offset_;
+
+    // 写入日志
+    if (!WriteEntryV2(current_fd_, entry, &current_offset_)) {
+      return false;
+    }
+
+    // 更新内存索引
+    log_index_[entry.index] = LogPosition(current_segment_id_, entry_offset, entry.term);
+
+    // 更新最大index和term
+    if (entry.index > max_index) {
+      max_index = entry.index;
+      max_term = entry.term;
+    }
+  }
+  
+  // 刷盘
+  if (!Sync()) {
+    return false;
+  }
+  
+  // 更新最后日志信息
+  if (max_index > last_index_) {
+    last_index_ = max_index;
+    last_term_ = max_term;
+  }
+  
+  return true;
+}
+
+uint64_t WAL::GetLastFlushedIndex() {
+  return last_flushed_index_.load();
+}
+
+bool WAL::WaitForFlush(uint64_t index, int timeout_ms) {
+  const int sleep_interval = 10; // ms
+  int waited = 0;
+  
+  while (waited < timeout_ms) {
+    if (last_flushed_index_ >= index) {
+      return true;
+    }
+    
+    // 如果异步刷盘未启用，检查last_index_
+    if (!async_flush_enabled_ && last_index_ >= index) {
+      return true;
+    }
+    
+    usleep(sleep_interval * 1000);
+    waited += sleep_interval;
+  }
+  
+  return false;
 }
 
 bool WAL::Init() {

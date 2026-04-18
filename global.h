@@ -1,6 +1,11 @@
 
 #ifndef STORAGE_RAFDB_GLOBAL_H_
 #define STORAGE_RAFDB_GLOBAL_H_
+
+#include <vector>
+#include <string>
+#include <stdint.h>
+
 typedef struct NodeInfo{
   std::string ip;
   int port;
@@ -9,11 +14,13 @@ typedef struct NodeInfo{
   NodeInfo(const std::string ip_p,const int port_p):ip(ip_p),port(port_p) {
   }
 }NodeInfo;
+
 typedef struct LKV{
   std::string dbname;
   std::string key;
   std::string value;
 }LKV;
+
 typedef struct LKV_SYNC{
   std::string dbname;
   std::string key;
@@ -29,5 +36,19 @@ typedef struct LKV_SYNC{
     value = value_p;
   }
 }LKV_SYNC;
+
+typedef struct BatchEntry {
+  std::string dbname;
+  std::string key;
+  std::string value;
+}BatchEntry;
+
+typedef struct PendingBatch {
+  uint64_t start_index;
+  uint64_t end_index;
+  std::vector<uint64_t> indices;
+  bool committed;
+  PendingBatch() : start_index(0), end_index(0), committed(false) {}
+}PendingBatch;
 
 #endif
