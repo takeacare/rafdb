@@ -472,11 +472,112 @@ void WAL::GetLastLogInfo(uint64_t* index, uint64_t* term) {
 
 bool WAL::TruncateTo(uint64_t index) {
   base::MutexLock lock(&mutex_);
-  // 找到包含index的段文件，截断后面的内容
-  // 简化实现，实际需要遍历所有段找到对应位置
+  
   LOG(INFO) << "Truncate WAL to index: " << index;
-  // 这里暂时只更新last_index，实际实现需要修改文件内容
+  
+  // 如果index >= last_index_，不需要截断
+  if (index >= last_index_) {
+    LOG(INFO) << "Index " << index << " is >= last_index_ " << last_index_ << ", no truncation needed";
+    return true;
+  }
+  
+  // 找到包含index的日志位置
+  base::hash_map<uint64_t, LogPosition>::iterator it = log_index_.find(index);
+  if (it == log_index_.end()) {
+    LOG(ERROR) << "Index " << index << " not found in WAL index";
+    return false;
+  }
+  
+  LogPosition& pos = it->second;
+  uint64_t truncate_segment_id = pos.segment_id;
+  uint64_t truncate_offset = pos.offset;
+  
+  // 1. 截断当前段文件（如果index在当前段）
+  if (truncate_segment_id == current_segment_id_) {
+    // 计算截断后的文件大小
+    // 需要找到index这条日志的结束位置
+    // 简化实现：我们需要读取这条日志来确定它的结束位置
+    int fd = OpenSegment(truncate_segment_id, true);
+    if (fd < 0) {
+      LOG(ERROR) << "Failed to open segment " << truncate_segment_id << " for truncation";
+      return false;
+    }
+    
+    // 读取这条日志来确定它的长度
+    LogEntry entry;
+    uint64_t offset = truncate_offset;
+    if (!ReadEntryV2(fd, &entry, &offset)) {
+      LOG(ERROR) << "Failed to read entry at index " << index;
+      close(fd);
+      return false;
+    }
+    
+    // offset现在指向这条日志之后的位置，这就是我们要截断的位置
+    if (ftruncate(fd, truncate_offset) != 0) {
+      LOG(ERROR) << "Failed to truncate segment " << truncate_segment_id << ": " << strerror(errno);
+      close(fd);
+      return false;
+    }
+    
+    // 更新current_offset_
+    current_offset_ = truncate_offset;
+    close(fd);
+  }
+  
+  // 2. 删除所有段ID大于truncate_segment_id的段文件
+  // 先收集要删除的段
+  std::vector<uint64_t> segments_to_delete;
+  for (base::hash_map<uint64_t, LogPosition>::iterator idx_it = log_index_.begin();
+       idx_it != log_index_.end(); ++idx_it) {
+    if (idx_it->first > index) {
+      uint64_t seg_id = idx_it->second.segment_id;
+      if (seg_id > truncate_segment_id) {
+        bool already_added = false;
+        for (size_t i = 0; i < segments_to_delete.size(); i++) {
+          if (segments_to_delete[i] == seg_id) {
+            already_added = true;
+            break;
+          }
+        }
+        if (!already_added && seg_id != current_segment_id_) {
+          segments_to_delete.push_back(seg_id);
+        }
+      }
+    }
+  }
+  
+  // 删除段文件
+  for (size_t i = 0; i < segments_to_delete.size(); i++) {
+    uint64_t seg_id = segments_to_delete[i];
+    std::string file_path = wal_dir_ + "/wal_" + std::to_string(seg_id);
+    if (unlink(file_path.c_str()) != 0) {
+      LOG(WARNING) << "Failed to delete WAL segment " << seg_id << ": " << strerror(errno);
+    } else {
+      LOG(INFO) << "Deleted WAL segment during truncation: " << file_path;
+    }
+  }
+  
+  // 3. 从内存索引中删除所有大于index的条目
+  base::hash_map<uint64_t, LogPosition>::iterator idx_it = log_index_.begin();
+  while (idx_it != log_index_.end()) {
+    if (idx_it->first > index) {
+      log_index_.erase(idx_it++);
+    } else {
+      ++idx_it;
+    }
+  }
+  
+  // 4. 更新last_index_和last_term_
   last_index_ = index;
+  
+  // 找到index对应的term
+  base::hash_map<uint64_t, LogPosition>::iterator term_it = log_index_.find(index);
+  if (term_it != log_index_.end()) {
+    last_term_ = term_it->second.term;
+  }
+  
+  LOG(INFO) << "WAL truncation completed, last_index=" << last_index_ << ", last_term=" << last_term_;
+  
   return true;
 }
 
@@ -503,7 +604,70 @@ bool WAL::CleanOldLogs(uint64_t commit_index, uint64_t keep_count) {
   base::MutexLock lock(&mutex_);
   uint64_t keep_from = commit_index > keep_count ? commit_index - keep_count : 0;
   LOG(INFO) << "Clean old WAL logs before index: " << keep_from;
-  // 实际实现需要删除所有只包含小于keep_from索引的段文件
+  
+  if (keep_from == 0) {
+    return true;
+  }
+  
+  // 收集每个段文件包含的最小和最大索引
+  base::hash_map<uint64_t, std::pair<uint64_t, uint64_t>> segment_index_range;
+  
+  for (base::hash_map<uint64_t, LogPosition>::iterator it = log_index_.begin();
+       it != log_index_.end(); ++it) {
+    uint64_t index = it->first;
+    uint64_t segment_id = it->second.segment_id;
+    
+    if (segment_index_range.find(segment_id) == segment_index_range.end()) {
+      segment_index_range[segment_id] = std::make_pair(index, index);
+    } else {
+      if (index < segment_index_range[segment_id].first) {
+        segment_index_range[segment_id].first = index;
+      }
+      if (index > segment_index_range[segment_id].second) {
+        segment_index_range[segment_id].second = index;
+      }
+    }
+  }
+  
+  // 找出可以删除的段文件（所有日志索引都小于keep_from）
+  std::vector<uint64_t> segments_to_delete;
+  for (base::hash_map<uint64_t, std::pair<uint64_t, uint64_t>>::iterator it = segment_index_range.begin();
+       it != segment_index_range.end(); ++it) {
+    uint64_t segment_id = it->first;
+    uint64_t min_index = it->second.first;
+    uint64_t max_index = it->second.second;
+    
+    // 如果段的最大索引小于keep_from，并且不是当前段，则可以删除
+    if (max_index < keep_from && segment_id != current_segment_id_) {
+      segments_to_delete.push_back(segment_id);
+      LOG(INFO) << "Marking segment " << segment_id << " for deletion (indices " 
+                << min_index << "-" << max_index << ")";
+    }
+  }
+  
+  // 删除段文件并更新内存索引
+  for (size_t i = 0; i < segments_to_delete.size(); i++) {
+    uint64_t segment_id = segments_to_delete[i];
+    std::string file_path = wal_dir_ + "/wal_" + std::to_string(segment_id);
+    
+    // 删除文件
+    if (unlink(file_path.c_str()) != 0) {
+      LOG(WARNING) << "Failed to delete WAL segment " << segment_id << ": " << strerror(errno);
+    } else {
+      LOG(INFO) << "Deleted WAL segment: " << file_path;
+    }
+    
+    // 从内存索引中删除该段的所有条目
+    base::hash_map<uint64_t, LogPosition>::iterator it = log_index_.begin();
+    while (it != log_index_.end()) {
+      if (it->second.segment_id == segment_id) {
+        log_index_.erase(it++);
+      } else {
+        ++it;
+      }
+    }
+  }
+  
   return true;
 }
 

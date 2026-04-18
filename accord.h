@@ -94,6 +94,16 @@ class Accord :public base::Thread  {
     void applyLogEntries();
     bool getLogTerm(uint64_t index, uint64_t* term);
     
+    // 快照相关方法
+    bool takeSnapshot(uint64_t* snapshot_index, uint64_t* snapshot_term);
+    bool installSnapshot(const Message& message);
+    void sendSnapshotToNode(const NodeInfo& node_info);
+    bool handleInstallSnapshotReq(Message& message);
+    bool handleInstallSnapshotRep(const Message& message);
+    
+    // 日志压缩相关
+    void compactLogs();
+    
     friend class Peer;
     scoped_ptr<Peer> peer_;
     RafDb* rafdb_;

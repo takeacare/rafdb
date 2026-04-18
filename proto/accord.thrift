@@ -33,6 +33,14 @@ enum MessageType {
   APPENDENTRIESREQ = 7,
   APPENDENTRIESREP = 8,
   TIMER = 9,
+  INSTALLSNAPSHOTREQ = 10,
+  INSTALLSNAPSHOTREP = 11,
+}
+
+struct SnapshotChunk {
+  1: i64 chunk_index,
+  2: binary data,
+  3: bool is_last,
 }
 
 struct Message {
@@ -52,6 +60,12 @@ struct Message {
   13: list<LogEntry> entries,
   14: i64 leader_commit,
   15: i64 match_index,
+  // InstallSnapshot RPC字段
+  16: i64 snapshot_term,
+  17: i64 snapshot_index,
+  18: list<SnapshotChunk> snapshot_chunks,
+  19: i64 snapshot_chunk_index,
+  20: bool snapshot_done,
 }
 
 

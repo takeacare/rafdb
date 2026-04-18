@@ -1013,6 +1013,19 @@ void RafDb::ReplyAppendEntries(const rafdb::Message& message) {
   tmp_m.message_type = MessageType::APPENDENTRIESREP;
   message_queue_.Push(tmp_m);
 }
+
+void RafDb::InstallSnapshot(const rafdb::Message& message) {
+  Message tmp_m = message;
+  tmp_m.message_type = MessageType::INSTALLSNAPSHOTREQ;
+  message_queue_.Push(tmp_m);
+}
+
+void RafDb::ReplyInstallSnapshot(const rafdb::Message& message) {
+  Message tmp_m = message;
+  tmp_m.message_type = MessageType::INSTALLSNAPSHOTREP;
+  message_queue_.Push(tmp_m);
+}
+
 bool RafDb::IsHealthy() {
   return true;
 }

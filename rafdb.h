@@ -95,6 +95,8 @@ class RafDb : virtual public rafdb::RafdbServiceIf {
     void ReplyLeaderId(const rafdb::Message& message);
     void SendAppendEntries(const rafdb::Message& message);
     void ReplyAppendEntries(const rafdb::Message& message);
+    void InstallSnapshot(const rafdb::Message& message);
+    void ReplyInstallSnapshot(const rafdb::Message& message);
     
     // Raft日志复制相关方法
     bool RaftSet(const std::string &dbname, const std::string &key, const std::string &value);

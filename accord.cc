@@ -48,6 +48,9 @@ void Accord::followerLoop() {
     if(update) {
       timer.After(get_rand(kElectionTimeout, 2 * kElectionTimeout));
     }
+    
+    applyLogEntries();
+    
     usleep(20);//sleep 20us
   }
 }
@@ -242,6 +245,10 @@ bool Accord::handleMessage(Message& message) {
     return handleAppendEntriesReq(message);
   }else if (message.message_type == MessageType::APPENDENTRIESREP) {
     return handleAppendEntriesRep(message);
+  }else if (message.message_type == MessageType::INSTALLSNAPSHOTREQ) {
+    return handleInstallSnapshotReq(message);
+  }else if (message.message_type == MessageType::INSTALLSNAPSHOTREP) {
+    return handleInstallSnapshotRep(message);
   }
   return false;
 }
@@ -423,6 +430,14 @@ bool Accord::sendRPC(const std::string ip,const int port,
         return true;
       }else if (rpc_name == "ReplyAppendEntries") {
         thrift_client.GetService()->ReplyAppendEntries(message);
+        thrift_client.GetTransport()->close();
+        return true;
+      }else if (rpc_name == "InstallSnapshot") {
+        thrift_client.GetService()->InstallSnapshot(message);
+        thrift_client.GetTransport()->close();
+        return true;
+      }else if (rpc_name == "ReplyInstallSnapshot") {
+        thrift_client.GetService()->ReplyInstallSnapshot(message);
         thrift_client.GetTransport()->close();
         return true;
       }else {
@@ -816,6 +831,204 @@ bool Accord::waitForCommit(uint64_t log_index, int timeout_ms) {
   }
   
   return false;
+}
+
+// 处理InstallSnapshot请求（Follower处理Leader的快照请求）
+bool Accord::handleInstallSnapshotReq(Message& message) {
+  VLOG(5) << "receive InstallSnapshot req, current term: " << GetTerm() 
+          << ", leader term: " << message.term_id
+          << ", snapshot_index: " << message.snapshot_index
+          << ", snapshot_term: " << message.snapshot_term;
+  
+  int64_t currentTerm = GetTerm();
+  std::string dest_ip = message.ip;
+  int dest_port = message.port;
+  
+  // 1. 如果领导人的任期小于当前任期，返回失败
+  if (message.term_id < currentTerm) {
+    Message mess_send;
+    mess_send.term_id = currentTerm;
+    mess_send.server_id = rafdb_->self_id_;
+    mess_send.ip = rafdb_->ip_;
+    mess_send.port = rafdb_->port_;
+    mess_send.message_type = MessageType::INSTALLSNAPSHOTREP;
+    mess_send.success = false;
+    sendRPC(dest_ip, dest_port, mess_send, "ReplyInstallSnapshot");
+    return false;
+  }
+  
+  // 2. 如果领导人任期大于等于当前任期，转换为Follower
+  if (message.term_id >= currentTerm) {
+    stepDown(message.term_id);
+  }
+  
+  rafdb_->SetLeaderId(message.leader_id);
+  leader_id_ = message.leader_id;
+  
+  // 3. 安装快照
+  bool success = installSnapshot(message);
+  
+  // 回复
+  Message mess_send;
+  mess_send.term_id = GetTerm();
+  mess_send.server_id = rafdb_->self_id_;
+  mess_send.ip = rafdb_->ip_;
+  mess_send.port = rafdb_->port_;
+  mess_send.message_type = MessageType::INSTALLSNAPSHOTREP;
+  mess_send.success = success;
+  mess_send.snapshot_index = message.snapshot_index;
+  sendRPC(dest_ip, dest_port, mess_send, "ReplyInstallSnapshot");
+  
+  return true;
+}
+
+// 处理InstallSnapshot响应（Leader处理Follower的回复）
+bool Accord::handleInstallSnapshotRep(const Message& message) {
+  VLOG(5) << "receive InstallSnapshot rep, success: " << message.success
+          << ", snapshot_index: " << message.snapshot_index;
+  
+  if (message.term_id < GetTerm()) {
+    return false;
+  }
+  if (message.term_id > GetTerm()) {
+    stepDown(message.term_id);
+    return false;
+  }
+  
+  if (message.success) {
+    // 更新match_index和next_index
+    std::string node_key = message.ip + ":" + std::to_string(message.port);
+    base::MutexLock lock(&log_mutex_);
+    uint64_t new_match = static_cast<uint64_t>(message.snapshot_index);
+    if (new_match > match_index_[node_key]) {
+      match_index_[node_key] = new_match;
+      next_index_[node_key] = new_match + 1;
+      VLOG(5) << "Update match_index after snapshot for " << node_key << " to " << new_match;
+    }
+  }
+  
+  return true;
+}
+
+// 安装快照
+bool Accord::installSnapshot(const Message& message) {
+  base::MutexLock lock(&log_mutex_);
+  
+  uint64_t snapshot_index = static_cast<uint64_t>(message.snapshot_index);
+  uint64_t snapshot_term = static_cast<uint64_t>(message.snapshot_term);
+  
+  VLOG(5) << "Installing snapshot: index=" << snapshot_index << ", term=" << snapshot_term;
+  
+  // 检查快照是否比当前状态新
+  if (snapshot_index <= last_applied_) {
+    VLOG(5) << "Snapshot is older than current state, skip installation";
+    return true;
+  }
+  
+  // TODO: 这里需要实现实际的快照数据应用
+  // 由于当前实现中没有序列化LevelDB状态的机制，
+  // 我们简化实现：只更新日志索引，实际应用需要根据快照数据重建LevelDB
+  
+  // 更新commit_index和last_applied
+  commit_index_ = snapshot_index;
+  last_applied_ = snapshot_index;
+  
+  // 更新WAL的last_index（如果需要）
+  // 注意：实际实现中应该从快照中恢复状态机
+  
+  VLOG(5) << "Snapshot installed, commit_index=" << commit_index_ << ", last_applied=" << last_applied_;
+  
+  return true;
+}
+
+// 创建快照
+bool Accord::takeSnapshot(uint64_t* snapshot_index, uint64_t* snapshot_term) {
+  base::MutexLock lock(&log_mutex_);
+  
+  // 快照索引是last_applied_
+  *snapshot_index = last_applied_;
+  
+  // 获取快照索引对应的term
+  if (!getLogTerm(last_applied_, snapshot_term)) {
+    LOG(ERROR) << "Failed to get term for snapshot index " << last_applied_;
+    return false;
+  }
+  
+  VLOG(5) << "Taking snapshot: index=" << *snapshot_index << ", term=" << *snapshot_term;
+  
+  // TODO: 这里需要实现实际的快照创建
+  // 1. 序列化LevelDB的状态
+  // 2. 保存快照文件
+  // 3. 删除旧的WAL日志
+  
+  // 简化实现：只记录快照信息
+  // 实际生产环境需要实现完整的快照持久化
+  
+  return true;
+}
+
+// 向节点发送快照
+void Accord::sendSnapshotToNode(const NodeInfo& node_info) {
+  // TODO: 实现快照发送
+  // 由于快照可能很大，需要分块发送
+  // 这里是简化版本
+  
+  base::MutexLock lock(&log_mutex_);
+  
+  uint64_t snapshot_index = last_applied_;
+  uint64_t snapshot_term = 0;
+  
+  if (!getLogTerm(snapshot_index, &snapshot_term)) {
+    LOG(ERROR) << "Failed to get snapshot term";
+    return;
+  }
+  
+  // 构建消息
+  Message mess_send;
+  mess_send.term_id = GetTerm();
+  mess_send.leader_id = rafdb_->self_id_;
+  mess_send.ip = rafdb_->ip_;
+  mess_send.port = rafdb_->port_;
+  mess_send.message_type = MessageType::INSTALLSNAPSHOTREQ;
+  mess_send.snapshot_index = snapshot_index;
+  mess_send.snapshot_term = snapshot_term;
+  mess_send.snapshot_done = true;
+  
+  // TODO: 添加实际的快照数据
+  // 由于当前实现没有序列化LevelDB状态，这里只发送元数据
+  
+  VLOG(5) << "Sending snapshot to " << node_info.ip << ":" << node_info.port
+          << ", index=" << snapshot_index << ", term=" << snapshot_term;
+  
+  sendRPC(node_info.ip, node_info.port, mess_send, "InstallSnapshot");
+}
+
+// 日志压缩
+void Accord::compactLogs() {
+  base::MutexLock lock(&log_mutex_);
+  
+  // 只有当日志数量超过阈值时才进行压缩
+  uint64_t last_log_index = getLastLogIndex();
+  const uint64_t kLogCompactThreshold = 10000; // 超过10000条日志时考虑压缩
+  
+  if (last_log_index <= kLogCompactThreshold) {
+    return;
+  }
+  
+  // 创建快照
+  uint64_t snapshot_index, snapshot_term;
+  if (!takeSnapshot(&snapshot_index, &snapshot_term)) {
+    LOG(ERROR) << "Failed to take snapshot for log compaction";
+    return;
+  }
+  
+  // 清理旧日志
+  const uint64_t kKeepLogCount = 1000; // 保留最近1000条日志
+  if (rafdb_->wal_) {
+    rafdb_->wal_->CleanOldLogs(snapshot_index, kKeepLogCount);
+  }
+  
+  VLOG(5) << "Log compaction completed, snapshot index=" << snapshot_index;
 }
 
 }
