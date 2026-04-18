@@ -93,8 +93,33 @@ class RafDb : virtual public rafdb::RafdbServiceIf {
     void ReplyHeartBeat(const rafdb::Message& message);
     void QueryLeaderId(const rafdb::Message& message);
     void ReplyLeaderId(const rafdb::Message& message);
-    std::vector<NodeInfo> NodeList; 
+    void SendAppendEntries(const rafdb::Message& message);
+    void ReplyAppendEntries(const rafdb::Message& message);
+    
+    // Raft日志复制相关方法
+    bool RaftSet(const std::string &dbname, const std::string &key, const std::string &value);
+    void ApplyLogEntry(const std::string &dbname, const std::string &key, const std::string &value);
+    
+    size_t GetNodeListSize() {
+      base::MutexLock lock(&node_list_mutex_);
+      return NodeList.size();
+    }
+    NodeInfo GetNodeInfo(size_t index) {
+      base::MutexLock lock(&node_list_mutex_);
+      if (index < NodeList.size()) {
+        return NodeList[index];
+      }
+      return NodeInfo();
+    }
+    void ForEachNodeInfo(void (*callback)(const NodeInfo&)) {
+      base::MutexLock lock(&node_list_mutex_);
+      for (size_t i = 0; i < NodeList.size(); i++) {
+        callback(NodeList[i]);
+      }
+    }
  private:
+    std::vector<NodeInfo> NodeList; 
+    base::Mutex node_list_mutex_;
   friend class IteratorChecker;
   friend class Manager;
   friend class Accord;

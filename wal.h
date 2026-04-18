@@ -27,6 +27,17 @@ struct LogEntry {
   uint32_t crc;         // 校验和
 };
 
+// 日志位置信息：记录日志在哪个段文件的哪个偏移位置
+struct LogPosition {
+  uint64_t segment_id;  // 段文件ID
+  uint64_t offset;      // 文件内偏移
+  uint64_t term;        // 日志任期（缓存，用于快速查询）
+  
+  LogPosition() : segment_id(0), offset(0), term(0) {}
+  LogPosition(uint64_t sid, uint64_t off, uint64_t t) 
+      : segment_id(sid), offset(off), term(t) {}
+};
+
 class WAL {
  public:
   WAL(const std::string& wal_dir, uint64_t segment_size = 128 * 1024 * 1024); // 默认128MB分段
@@ -43,6 +54,12 @@ class WAL {
 
   // 从指定索引开始读取日志，调用callback处理每条日志
   bool ReadFrom(uint64_t index, void (*callback)(const LogEntry&));
+
+  // 按索引获取单条日志
+  bool GetLogEntry(uint64_t index, LogEntry* entry);
+
+  // 按索引获取日志的term（快速查询，不需要读取整个日志）
+  bool GetLogTerm(uint64_t index, uint64_t* term);
 
   // 强制刷盘
   bool Sync();
@@ -66,6 +83,10 @@ class WAL {
   uint64_t last_term_;           // 最后一条日志的任期
   base::Mutex mutex_;            // 线程安全锁
 
+  // 内存索引：index -> (segment_id, offset, term)
+  // 用于快速查找历史日志的位置和term
+  base::hash_map<uint64_t, LogPosition> log_index_;
+
   // 打开指定段ID的文件
   int OpenSegment(uint64_t segment_id, bool write = false);
 
@@ -75,11 +96,18 @@ class WAL {
   // 计算日志条目的CRC32校验和
   uint32_t CalculateCRC(const LogEntry& entry);
 
-  // 从文件中读取一条日志条目
-  bool ReadEntry(int fd, LogEntry* entry, uint64_t* offset);
+  // 从文件中读取一条日志条目（新版本，使用长度前缀）
+  bool ReadEntryV2(int fd, LogEntry* entry, uint64_t* offset);
 
-  // 写入一条日志条目到文件
+  // 写入一条日志条目到文件（新版本，使用长度前缀）
+  bool WriteEntryV2(int fd, const LogEntry& entry, uint64_t* offset);
+
+  // 旧版本的读写（兼容，实际不再使用）
+  bool ReadEntry(int fd, LogEntry* entry, uint64_t* offset);
   bool WriteEntry(int fd, const LogEntry& entry, uint64_t* offset);
+
+  // 构建索引：扫描所有段文件，建立index到位置的映射
+  bool BuildIndex();
 };
 
 } // namespace rafdb

@@ -11,9 +11,11 @@ void Peer::Run() {
   while ( true ) {
     if (GetRunFlag()) {
       int num = 0;
-      for(size_t i=0;i<accord_->rafdb_->NodeList.size();i++) {
-        std::string dest_ip = accord_->rafdb_->NodeList[i].ip;
-        int dest_port = accord_->rafdb_->NodeList[i].port;
+      size_t node_count = accord_->rafdb_->GetNodeListSize();
+      for(size_t i = 0; i < node_count; i++) {
+        NodeInfo node_info = accord_->rafdb_->GetNodeInfo(i);
+        std::string dest_ip = node_info.ip;
+        int dest_port = node_info.port;
         Message mess_send;
         mess_send.term_id = accord_->GetTerm();
         mess_send.ip = accord_->rafdb_->ip_;

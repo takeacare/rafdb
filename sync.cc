@@ -19,17 +19,18 @@ Sync::Sync(RafDb *rafdb)
     comsume_fail_queue_thread();
     if (NULL==sync_pool || NULL==for_fail_pool)
         VLOG(3)<<"sync_pool or for_fail_pool ==NULL";
-    if (rafdb_->NodeList.empty())
+    size_t node_count = rafdb_->GetNodeListSize();
+    if (node_count == 0)
         VLOG(3)<<"NodeList is Empty";
-    for(std::vector<NodeInfo>::iterator iter=rafdb_->NodeList.begin(); iter != rafdb_->NodeList.end();iter++)
+    for(size_t i = 0; i < node_count; i++)
     {
-        std::string ip_port=toIpPort(*iter);
+        NodeInfo node_info = rafdb_->GetNodeInfo(i);
+        std::string ip_port=toIpPort(node_info);
         node_status_map[ip_port]=alive;
-        rafdb::RafdbSync *dbSync=new RafdbSync(*iter);
+        rafdb::RafdbSync *dbSync=new RafdbSync(node_info);
         node_set_map[ip_port]=dbSync;
         fail_time_map[ip_port]=0;
         VLOG(3)<<"put in map : "<<ip_port;
-        
     }
     load_cache();
 }
@@ -195,8 +196,13 @@ void Sync::sync_process(LKV_SYNC *lkv)
     else
     {
         VLOG(3)<<"the ip_port :"<<ip_port<< " is not in node_status_map";
-        delete lkv;
     }
+    // 修复内存泄漏：所有不return的路径都需要delete lkv
+    // 路径1：Set失败（第173-181行）
+    // 路径2：ip_port在node_status_map但不在node_set_map（第183-184行）
+    // 路径3：节点不alive（第186-194行）
+    // 路径4：ip_port不在node_status_map（第196-199行）- 原来这里有delete，但逻辑上应该统一处理
+    delete lkv;
 }
 void Sync::push(LKV_SYNC *lkv)
 {

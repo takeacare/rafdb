@@ -11,8 +11,10 @@ namespace rafdb {
 
 // 日志文件头魔法数
 const uint32_t kMagicNumber = 0x57414C30; // "WAL0"
-// 日志条目头部大小：magic(4) + length(4) + type(1) + index(8) + term(8) + data_len(4) = 29字节
-const uint32_t kEntryHeaderSize = 29;
+// 日志条目头部大小（V2版本）：
+// magic(4) + total_len(4) + type(1) + index(8) + term(8) + 
+// dbname_len(4) + key_len(4) + value_len(4) + crc(4) = 42字节
+const uint32_t kEntryHeaderSizeV2 = 42;
 
 WAL::WAL(const std::string& wal_dir, uint64_t segment_size)
     : wal_dir_(wal_dir),
@@ -138,33 +140,45 @@ uint32_t WAL::CalculateCRC(const LogEntry& entry) {
   return crc ^ 0xFFFFFFFF;
 }
 
-bool WAL::WriteEntry(int fd, const LogEntry& entry, uint64_t* offset) {
-  uint32_t data_len = entry.dbname.size() + entry.key.size() + entry.value.size();
-  uint32_t total_len = kEntryHeaderSize + data_len + 4; // +4 for CRC
+// V2版本：使用长度前缀，正确的序列化格式
+bool WAL::WriteEntryV2(int fd, const LogEntry& entry, uint64_t* offset) {
+  uint32_t dbname_len = static_cast<uint32_t>(entry.dbname.size());
+  uint32_t key_len = static_cast<uint32_t>(entry.key.size());
+  uint32_t value_len = static_cast<uint32_t>(entry.value.size());
+  uint32_t total_len = kEntryHeaderSizeV2 + dbname_len + key_len + value_len;
 
   // 分配缓冲区
   std::vector<uint8_t> buf(total_len);
   uint8_t* ptr = buf.data();
 
-  // 写入头
+  // 写入头部
   *reinterpret_cast<uint32_t*>(ptr) = kMagicNumber; ptr += 4;
   *reinterpret_cast<uint32_t*>(ptr) = total_len; ptr += 4;
   *ptr = static_cast<uint8_t>(entry.type); ptr += 1;
   *reinterpret_cast<uint64_t*>(ptr) = entry.index; ptr += 8;
   *reinterpret_cast<uint64_t*>(ptr) = entry.term; ptr += 8;
-  *reinterpret_cast<uint32_t*>(ptr) = data_len; ptr +=4;
+  *reinterpret_cast<uint32_t*>(ptr) = dbname_len; ptr += 4;
+  *reinterpret_cast<uint32_t*>(ptr) = key_len; ptr += 4;
+  *reinterpret_cast<uint32_t*>(ptr) = value_len; ptr += 4;
+  *reinterpret_cast<uint32_t*>(ptr) = entry.crc; ptr += 4;
 
   // 写入数据
-  memcpy(ptr, entry.dbname.data(), entry.dbname.size()); ptr += entry.dbname.size();
-  memcpy(ptr, entry.key.data(), entry.key.size()); ptr += entry.key.size();
-  memcpy(ptr, entry.value.data(), entry.value.size()); ptr += entry.value.size();
-
-  // 写入CRC
-  *reinterpret_cast<uint32_t*>(ptr) = entry.crc; ptr +=4;
+  if (dbname_len > 0) {
+    memcpy(ptr, entry.dbname.data(), dbname_len);
+    ptr += dbname_len;
+  }
+  if (key_len > 0) {
+    memcpy(ptr, entry.key.data(), key_len);
+    ptr += key_len;
+  }
+  if (value_len > 0) {
+    memcpy(ptr, entry.value.data(), value_len);
+    ptr += value_len;
+  }
 
   // 写入文件
   ssize_t written = write(fd, buf.data(), total_len);
-  if (written != total_len) {
+  if (written != static_cast<ssize_t>(total_len)) {
     LOG(ERROR) << "Failed to write wal entry, written: " << written << ", expected: " << total_len;
     return false;
   }
@@ -173,57 +187,76 @@ bool WAL::WriteEntry(int fd, const LogEntry& entry, uint64_t* offset) {
   return true;
 }
 
-bool WAL::ReadEntry(int fd, LogEntry* entry, uint64_t* offset) {
+// V2版本：按长度读取，对应WriteEntryV2的格式
+bool WAL::ReadEntryV2(int fd, LogEntry* entry, uint64_t* offset) {
   // 读取头部
-  uint8_t header[kEntryHeaderSize];
-  ssize_t read_size = pread(fd, header, kEntryHeaderSize, *offset);
-  if (read_size != kEntryHeaderSize) {
+  uint8_t header[kEntryHeaderSizeV2];
+  ssize_t read_size = pread(fd, header, kEntryHeaderSizeV2, *offset);
+  if (read_size != static_cast<ssize_t>(kEntryHeaderSizeV2)) {
     if (read_size == 0) {
       return false; // 文件结束
     }
-    LOG(ERROR) << "Failed to read wal header, read: " << read_size << ", expected: " << kEntryHeaderSize;
+    if (read_size < 4) {
+      return false; // 无法读取magic
+    }
+    // 检查magic是否有效
+    uint32_t magic = *reinterpret_cast<uint32_t*>(header);
+    if (magic != kMagicNumber) {
+      return false;
+    }
+    LOG(ERROR) << "Failed to read wal header, read: " << read_size << ", expected: " << kEntryHeaderSizeV2;
     return false;
   }
 
   uint8_t* ptr = header;
-  uint32_t magic = *reinterpret_cast<uint32_t*>(ptr); ptr +=4;
+  uint32_t magic = *reinterpret_cast<uint32_t*>(ptr); ptr += 4;
   if (magic != kMagicNumber) {
-    LOG(ERROR) << "Invalid wal magic number: " << magic << ", expected: " << kMagicNumber;
-    return false;
+    return false; // 不是有效的日志条目
   }
 
-  uint32_t total_len = *reinterpret_cast<uint32_t*>(ptr); ptr +=4;
-  entry->type = static_cast<LogType>(*ptr); ptr +=1;
-  entry->index = *reinterpret_cast<uint64_t*>(ptr); ptr +=8;
-  entry->term = *reinterpret_cast<uint64_t*>(ptr); ptr +=8;
-  uint32_t data_len = *reinterpret_cast<uint32_t*>(ptr); ptr +=4;
+  uint32_t total_len = *reinterpret_cast<uint32_t*>(ptr); ptr += 4;
+  entry->type = static_cast<LogType>(*ptr); ptr += 1;
+  entry->index = *reinterpret_cast<uint64_t*>(ptr); ptr += 8;
+  entry->term = *reinterpret_cast<uint64_t*>(ptr); ptr += 8;
+  uint32_t dbname_len = *reinterpret_cast<uint32_t*>(ptr); ptr += 4;
+  uint32_t key_len = *reinterpret_cast<uint32_t*>(ptr); ptr += 4;
+  uint32_t value_len = *reinterpret_cast<uint32_t*>(ptr); ptr += 4;
+  entry->crc = *reinterpret_cast<uint32_t*>(ptr); ptr += 4;
 
   // 读取数据部分
-  std::vector<uint8_t> data(data_len + 4); // +4 for CRC
-  read_size = pread(fd, data.data(), data_len +4, *offset + kEntryHeaderSize);
-  if (read_size != (ssize_t)(data_len +4)) {
-    LOG(ERROR) << "Failed to read wal data, read: " << read_size << ", expected: " << data_len +4;
-    return false;
+  uint32_t data_len = dbname_len + key_len + value_len;
+  if (data_len > 0) {
+    std::vector<uint8_t> data(data_len);
+    read_size = pread(fd, data.data(), data_len, *offset + kEntryHeaderSizeV2);
+    if (read_size != static_cast<ssize_t>(data_len)) {
+      LOG(ERROR) << "Failed to read wal data, read: " << read_size << ", expected: " << data_len;
+      return false;
+    }
+
+    ptr = data.data();
+    if (dbname_len > 0) {
+      entry->dbname.assign(reinterpret_cast<const char*>(ptr), dbname_len);
+      ptr += dbname_len;
+    } else {
+      entry->dbname.clear();
+    }
+    if (key_len > 0) {
+      entry->key.assign(reinterpret_cast<const char*>(ptr), key_len);
+      ptr += key_len;
+    } else {
+      entry->key.clear();
+    }
+    if (value_len > 0) {
+      entry->value.assign(reinterpret_cast<const char*>(ptr), value_len);
+      ptr += value_len;
+    } else {
+      entry->value.clear();
+    }
+  } else {
+    entry->dbname.clear();
+    entry->key.clear();
+    entry->value.clear();
   }
-
-  // 解析数据
-  ptr = data.data();
-  uint32_t dbname_len = 0;
-  // 实际实现中需要在LogEntry中记录各字段长度，这里简化处理
-  // 暂时假设dbname、key、value都以\\0分隔，实际项目中应使用更可靠的序列化方式
-  const char* dbname = reinterpret_cast<const char*>(ptr);
-  entry->dbname = dbname;
-  ptr += entry->dbname.size() + 1;
-
-  const char* key = reinterpret_cast<const char*>(ptr);
-  entry->key = key;
-  ptr += entry->key.size() + 1;
-
-  const char* value = reinterpret_cast<const char*>(ptr);
-  entry->value = value;
-  ptr += entry->value.size() + 1;
-
-  entry->crc = *reinterpret_cast<uint32_t*>(ptr); ptr +=4;
 
   // 校验CRC
   uint32_t calc_crc = CalculateCRC(*entry);
@@ -236,6 +269,16 @@ bool WAL::ReadEntry(int fd, LogEntry* entry, uint64_t* offset) {
   return true;
 }
 
+// 旧版本的WriteEntry（保留但标记为废弃）
+bool WAL::WriteEntry(int fd, const LogEntry& entry, uint64_t* offset) {
+  return WriteEntryV2(fd, entry, offset);
+}
+
+// 旧版本的ReadEntry（保留但标记为废弃）
+bool WAL::ReadEntry(int fd, LogEntry* entry, uint64_t* offset) {
+  return ReadEntryV2(fd, entry, offset);
+}
+
 bool WAL::AppendLog(const LogEntry& entry, bool sync) {
   base::MutexLock lock(&mutex_);
   if (current_fd_ < 0) {
@@ -244,7 +287,11 @@ bool WAL::AppendLog(const LogEntry& entry, bool sync) {
   }
 
   // 检查是否需要滚动段文件
-  if (current_offset_ + kEntryHeaderSize + entry.dbname.size() + entry.key.size() + entry.value.size() + 4 > segment_size_) {
+  uint32_t entry_size = kEntryHeaderSizeV2 + 
+                        static_cast<uint32_t>(entry.dbname.size()) + 
+                        static_cast<uint32_t>(entry.key.size()) + 
+                        static_cast<uint32_t>(entry.value.size());
+  if (current_offset_ + entry_size > segment_size_) {
     if (!RotateSegment()) {
       return false;
     }
@@ -254,8 +301,11 @@ bool WAL::AppendLog(const LogEntry& entry, bool sync) {
   LogEntry entry_with_crc = entry;
   entry_with_crc.crc = CalculateCRC(entry);
 
+  // 记录写入前的偏移（用于索引）
+  uint64_t entry_offset = current_offset_;
+
   // 写入日志
-  if (!WriteEntry(current_fd_, entry_with_crc, &current_offset_)) {
+  if (!WriteEntryV2(current_fd_, entry_with_crc, &current_offset_)) {
     return false;
   }
 
@@ -266,9 +316,15 @@ bool WAL::AppendLog(const LogEntry& entry, bool sync) {
     }
   }
 
+  // 更新内存索引
+  log_index_[entry.index] = LogPosition(current_segment_id_, entry_offset, entry.term);
+
   // 更新最后日志信息
   last_index_ = entry.index;
   last_term_ = entry.term;
+
+  VLOG(5) << "AppendLog: index=" << entry.index << ", term=" << entry.term 
+          << ", segment=" << current_segment_id_ << ", offset=" << entry_offset;
 
   return true;
 }
@@ -284,10 +340,9 @@ bool WAL::Sync() {
   return true;
 }
 
-bool WAL::Recovery(uint64_t* last_index, uint64_t* last_term) {
-  base::MutexLock lock(&mutex_);
-  *last_index = 0;
-  *last_term = 0;
+// 构建内存索引：扫描所有段文件，建立index到(segment_id, offset, term)的映射
+bool WAL::BuildIndex() {
+  log_index_.clear();
   uint64_t max_index = 0;
   uint64_t max_term = 0;
 
@@ -301,7 +356,21 @@ bool WAL::Recovery(uint64_t* last_index, uint64_t* last_term) {
 
     uint64_t offset = 0;
     LogEntry entry;
-    while (ReadEntry(fd, &entry, &offset)) {
+    while (ReadEntryV2(fd, &entry, &offset)) {
+      // 记录索引位置（offset - 这条日志的长度 = 这条日志的起始偏移）
+      // 但更简单的是在读取前记录offset
+      uint64_t entry_offset = offset - (kEntryHeaderSizeV2 + 
+                        static_cast<uint32_t>(entry.dbname.size()) + 
+                        static_cast<uint32_t>(entry.key.size()) + 
+                        static_cast<uint32_t>(entry.value.size()));
+      
+      // 实际上我们需要重新读取，让我们简化：重新扫描，这次同时记录位置
+      // 这里我们只记录index和term，位置可以简化处理
+      // 更好的做法是：关闭fd，重新扫描并记录位置
+      
+      // 暂时简化：只记录index和term
+      log_index_[entry.index] = LogPosition(seg_id, 0, entry.term);
+      
       if (entry.index > max_index) {
         max_index = entry.index;
         max_term = entry.term;
@@ -310,11 +379,88 @@ bool WAL::Recovery(uint64_t* last_index, uint64_t* last_term) {
     close(fd);
   }
 
+  // 重新扫描，这次记录准确的偏移位置
+  // 这是一个简化实现，实际生产环境可以优化
+  for (uint64_t seg_id = 1; seg_id <= current_segment_id_; seg_id++) {
+    int fd = OpenSegment(seg_id, false);
+    if (fd < 0) {
+      continue;
+    }
+
+    uint64_t offset = 0;
+    LogEntry entry;
+    while (true) {
+      uint64_t entry_start_offset = offset;
+      if (!ReadEntryV2(fd, &entry, &offset)) {
+        break;
+      }
+      // 更新准确的偏移位置
+      if (log_index_.find(entry.index) != log_index_.end()) {
+        log_index_[entry.index].offset = entry_start_offset;
+      }
+    }
+    close(fd);
+  }
+
   last_index_ = max_index;
   last_term_ = max_term;
-  *last_index = max_index;
-  *last_term = max_term;
-  LOG(INFO) << "WAL recovery completed, last index: " << max_index << ", last term: " << max_term;
+  LOG(INFO) << "WAL BuildIndex completed, total entries: " << log_index_.size() 
+            << ", last index: " << max_index << ", last term: " << max_term;
+  return true;
+}
+
+bool WAL::Recovery(uint64_t* last_index, uint64_t* last_term) {
+  base::MutexLock lock(&mutex_);
+  
+  // 构建内存索引
+  BuildIndex();
+  
+  *last_index = last_index_;
+  *last_term = last_term_;
+  LOG(INFO) << "WAL recovery completed, last index: " << last_index_ << ", last term: " << last_term_;
+  return true;
+}
+
+// 按索引获取单条日志
+bool WAL::GetLogEntry(uint64_t index, LogEntry* entry) {
+  base::MutexLock lock(&mutex_);
+  
+  base::hash_map<uint64_t, LogPosition>::iterator it = log_index_.find(index);
+  if (it == log_index_.end()) {
+    VLOG(5) << "GetLogEntry: index " << index << " not found in index";
+    return false;
+  }
+  
+  LogPosition& pos = it->second;
+  int fd = OpenSegment(pos.segment_id, false);
+  if (fd < 0) {
+    LOG(ERROR) << "GetLogEntry: failed to open segment " << pos.segment_id;
+    return false;
+  }
+  
+  uint64_t offset = pos.offset;
+  bool result = ReadEntryV2(fd, entry, &offset);
+  close(fd);
+  
+  if (result && entry->index != index) {
+    LOG(ERROR) << "GetLogEntry: index mismatch, expected " << index << ", got " << entry->index;
+    return false;
+  }
+  
+  return result;
+}
+
+// 按索引获取日志的term（快速查询，不需要读取整个日志）
+bool WAL::GetLogTerm(uint64_t index, uint64_t* term) {
+  base::MutexLock lock(&mutex_);
+  
+  base::hash_map<uint64_t, LogPosition>::iterator it = log_index_.find(index);
+  if (it == log_index_.end()) {
+    VLOG(5) << "GetLogTerm: index " << index << " not found in index";
+    return false;
+  }
+  
+  *term = it->second.term;
   return true;
 }
 

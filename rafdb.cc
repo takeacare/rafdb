@@ -1000,7 +1000,18 @@ void RafDb::ReplyLeaderId(const rafdb::Message& message) {
   Message tmp_m = message;
   tmp_m.message_type = MessageType::LEADERREP;
   message_queue_.Push(tmp_m);
+}
 
+void RafDb::SendAppendEntries(const rafdb::Message& message) {
+  Message tmp_m = message;
+  tmp_m.message_type = MessageType::APPENDENTRIESREQ;
+  message_queue_.Push(tmp_m);
+}
+
+void RafDb::ReplyAppendEntries(const rafdb::Message& message) {
+  Message tmp_m = message;
+  tmp_m.message_type = MessageType::APPENDENTRIESREP;
+  message_queue_.Push(tmp_m);
 }
 bool RafDb::IsHealthy() {
   return true;
@@ -1008,16 +1019,58 @@ bool RafDb::IsHealthy() {
 
 bool RafDb::LSet(const std::string &dbname, const std::string &key,
        const std::string &value) {
-  if(Set(dbname,key,value)) {
-    LKV *tmp_lkv = new LKV();
-    tmp_lkv->dbname = dbname;
-    tmp_lkv->key = key;
-    tmp_lkv->value = value;
-    lkv_queue_.Push(tmp_lkv);
-    VLOG(5)<<"set success,push to queue";
-    return true;
-  }  
-  return false;
+  // 使用Raft协议进行写入
+  return RaftSet(dbname, key, value);
+}
+
+// Raft协议的写入实现
+bool RafDb::RaftSet(const std::string &dbname, const std::string &key, const std::string &value) {
+  // 1. 检查是否是Leader
+  if (!IsLeader()) {
+    LOG(WARNING) << "RaftSet: not leader, cannot write";
+    return false;
+  }
+  
+  VLOG(5) << "RaftSet: dbname=" << dbname << ", key=" << key;
+  
+  // 2. 创建日志条目并追加到WAL
+  LogEntry entry;
+  entry.type = LOG_TYPE_NORMAL;
+  entry.dbname = dbname;
+  entry.key = key;
+  entry.value = value;
+  
+  if (!accord_->appendLogEntry(entry)) {
+    LOG(ERROR) << "RaftSet: failed to append log entry";
+    return false;
+  }
+  
+  // 3. 获取新写入日志的索引
+  uint64_t log_index = accord_->getLastLogIndex();
+  VLOG(5) << "RaftSet: log index=" << log_index;
+  
+  // 4. 立即向所有Follower发送AppendEntries
+  accord_->sendAppendEntriesToAll();
+  
+  // 5. 等待多数节点确认（等待日志被提交）
+  const int kTimeoutMs = 5000; // 5秒超时
+  if (!accord_->waitForCommit(log_index, kTimeoutMs)) {
+    LOG(ERROR) << "RaftSet: timeout waiting for commit, log index=" << log_index;
+    return false;
+  }
+  
+  // 6. 日志已提交，应用到状态机（写入LevelDB）
+  ApplyLogEntry(dbname, key, value);
+  
+  VLOG(5) << "RaftSet: success, log index=" << log_index;
+  return true;
+}
+
+// 应用日志条目到状态机（写入LevelDB）
+void RafDb::ApplyLogEntry(const std::string &dbname, const std::string &key, const std::string &value) {
+  if (!Set(dbname, key, value)) {
+    LOG(ERROR) << "ApplyLogEntry: failed to apply log entry to LevelDB";
+  }
 }
 
 

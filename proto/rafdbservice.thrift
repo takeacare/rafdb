@@ -35,6 +35,8 @@ service RafdbService {
     oneway void ReplyHeartBeat(1:  accord.Message message);
     oneway void QueryLeaderId(1:  accord.Message message);
     oneway void ReplyLeaderId(1:  accord.Message message);
+    oneway void SendAppendEntries(1:  accord.Message message);
+    oneway void ReplyAppendEntries(1:  accord.Message message);
    
 }
 
